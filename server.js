@@ -6,6 +6,8 @@ const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+const QRCode = require('qrcode');
+let qrCodeData = '';
 let sock = null;
 let conectado = false;
 let conectando = false;
@@ -20,13 +22,30 @@ async function connectToWhatsApp() {
             browser: Browsers.macOS('Desktop'),
             syncFullHistory: false
         });
-
+        
         sock.ev.on('creds.update', saveCreds);
         sock.ev.on('connection.update', ({ connection, qr, lastDisconnect }) => {
             if (qr) {
                 console.log('\nEscanee este QR con WhatsApp para vincular el equipo:');
                 qrcode.generate(qr, { small: true });
+                qrCodeData = qr;
             }
+            app.get('/qr', async (req, res) => {
+                if (!qrCodeData) {
+                return res.send('<h1>WhatsApp ya está conectado o el QR no se ha generado aún.</h1>');
+            }
+            try {
+                const qrImage = await QRCode.toDataURL(qrCodeData);
+                res.send(`
+                    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;">
+                    <h2>Escanea este QR con WhatsApp</h2>
+                    <img src="${qrImage}" alt="QR Code" style="width:300px;height:300px;"/>
+                    </div>
+        `               );
+            } catch (err) {
+                res.status(500).send('Error generando la imagen del QR');
+            }
+});
             if (connection === 'open') {
                 conectado = true;
                 conectando = false;
