@@ -77,7 +77,8 @@ app.post('/send-message', async (req, res) => {
     }
 });
 
-app.listen(3000, '127.0.0.1', () => {
-    console.log('API local de WhatsApp lista en http://127.0.0.1:3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`API de WhatsApp ejecutándose en el puerto ${PORT}`);
     connectToWhatsApp();
 });
