@@ -53,6 +53,11 @@ let qrCodeData = '';
 let cambiandoNumero = false;
 let reconnectTimer = null;
 
+// Permite identificar sockets antiguos.
+// Evita que una conexión anterior provoque nuevas reconexiones
+// después de que otro socket ya haya tomado su lugar.
+let socketGeneration = 0;
+
 // IDs utilizados en Supabase.
 const CREDS_ID = 'baileys:creds';
 const KEY_PREFIX = 'baileys:key:';
@@ -323,132 +328,339 @@ function programarReconexion(ms = 3000) {
 // ======================================================
 
 async function connectToWhatsApp() {
+
+    // ==================================================
+    // EVITAR CONEXIONES DUPLICADAS
+    // ==================================================
+
     if (conectando) {
         console.log(
             'Ya existe un intento de conexión.'
         );
+
         return;
     }
 
+
+    if (sock && conectado) {
+
+        console.log(
+            'WhatsApp ya está conectado. ' +
+            'No se creará otro socket.'
+        );
+
+        return;
+    }
+
+
     conectando = true;
 
+
+    /*
+     * Cada nueva conexión obtiene un número.
+     *
+     * Si posteriormente se crea otro socket,
+     * los eventos pertenecientes al anterior
+     * serán ignorados.
+     */
+    const myGeneration = ++socketGeneration;
+
+
     try {
+
         console.log(
             'Iniciando conexión con WhatsApp...'
         );
 
+
+        // ==============================================
+        // RECUPERAR CREDENCIALES DE SUPABASE
+        // ==============================================
+
         const {
             state,
             saveCreds
+
         } = await useSupabaseAuthState();
 
-        sock = makeWASocket({
+
+        /*
+         * Es posible que mientras esperábamos la respuesta
+         * de Supabase se haya iniciado otra conexión.
+         *
+         * En ese caso abandonamos este intento.
+         */
+        if (
+            myGeneration !== socketGeneration
+        ) {
+
+            conectando = false;
+
+            console.log(
+                'Intento de conexión antiguo cancelado.'
+            );
+
+            return;
+        }
+
+
+        // ==============================================
+        // CREAR SOCKET DE WHATSAPP
+        // ==============================================
+
+        const currentSock = makeWASocket({
+
             auth: state,
 
+
             browser:
-                Browsers.macOS('Desktop'),
+                Browsers.macOS(
+                    'Desktop'
+                ),
+
 
             syncFullHistory: false,
 
+
             markOnlineOnConnect: false
+
         });
+
+
+        /*
+         * Guardamos este socket como
+         * la conexión actualmente válida.
+         */
+        sock = currentSock;
+
 
         // ==============================================
         // GUARDAR CREDENCIALES
         // ==============================================
 
-        sock.ev.on(
+        currentSock.ev.on(
+
             'creds.update',
+
             async () => {
+
+
+                /*
+                 * Si estas credenciales pertenecen
+                 * a un socket anterior, no las guardamos.
+                 *
+                 * Esto evita que un socket viejo sobrescriba
+                 * en Supabase las credenciales de uno nuevo.
+                 */
+                if (
+                    myGeneration !== socketGeneration ||
+                    sock !== currentSock
+                ) {
+
+                    return;
+                }
+
+
                 try {
+
                     await saveCreds();
+
 
                     console.log(
                         'Credenciales actualizadas en Supabase.'
                     );
+
+
                 } catch (error) {
+
                     console.error(
                         'Error guardando credenciales:',
                         error.message
                     );
+
                 }
+
             }
+
         );
+
 
         // ==============================================
         // EVENTOS DE CONEXIÓN
         // ==============================================
 
-        sock.ev.on(
+        currentSock.ev.on(
+
             'connection.update',
+
             ({
+
                 connection,
+
                 qr,
+
                 lastDisconnect
+
             }) => {
+
+
+                /*
+                 * MUY IMPORTANTE:
+                 *
+                 * Ignoramos cualquier evento perteneciente
+                 * a un socket que ya haya sido reemplazado.
+                 */
+                if (
+                    myGeneration !== socketGeneration ||
+                    sock !== currentSock
+                ) {
+
+                    console.log(
+                        'Evento ignorado de un socket anterior.'
+                    );
+
+                    return;
+                }
+
+
+                // ======================================
+                // NUEVO QR
+                // ======================================
+
                 if (qr) {
+
                     qrCodeData = qr;
 
+
                     console.log('');
+
                     console.log(
                         '================================'
                     );
+
                     console.log(
                         'NUEVO QR GENERADO'
                     );
+
                     console.log(
                         '================================'
                     );
+
                     console.log(
                         'Visite /qr para escanearlo.'
                     );
 
+
                     qrcodeTerminal.generate(
+
                         qr,
+
                         {
                             small: true
                         }
+
                     );
+
                 }
 
-                if (connection === 'open') {
+
+                // ======================================
+                // WHATSAPP CONECTADO
+                // ======================================
+
+                if (
+                    connection === 'open'
+                ) {
+
                     conectado = true;
+
                     conectando = false;
+
                     cambiandoNumero = false;
+
                     qrCodeData = '';
 
+
+                    /*
+                     * Si existía una reconexión pendiente
+                     * ya no es necesaria.
+                     */
+                    if (reconnectTimer) {
+
+                        clearTimeout(
+                            reconnectTimer
+                        );
+
+                        reconnectTimer = null;
+
+                    }
+
+
                     console.log('');
+
                     console.log(
                         '================================'
                     );
+
                     console.log(
                         'WHATSAPP CONECTADO'
                     );
+
                     console.log(
                         '================================'
                     );
+
                 }
 
-                if (connection === 'close') {
+
+                // ======================================
+                // CONEXIÓN CERRADA
+                // ======================================
+
+                if (
+                    connection === 'close'
+                ) {
+
                     conectado = false;
+
                     conectando = false;
 
+
                     const statusCode =
+
                         lastDisconnect
                             ?.error
                             ?.output
                             ?.statusCode;
 
+
                     console.log(
+
                         'Conexión cerrada. Código:',
+
                         statusCode
+
                     );
 
+
+                    // ==================================
+                    // LOGOUT REAL DE WHATSAPP
+                    // ==================================
+
                     const loggedOut =
+
                         statusCode ===
                         DisconnectReason.loggedOut;
 
-                    if (cambiandoNumero) {
+
+                    // ==================================
+                    // CAMBIO DE NÚMERO
+                    // ==================================
+
+                    if (
+                        cambiandoNumero
+                    ) {
+
                         console.log(
                             'Cambio de número en proceso.'
                         );
@@ -456,36 +668,228 @@ async function connectToWhatsApp() {
                         return;
                     }
 
-                    if (loggedOut) {
+
+                    // ==================================
+                    // SESIÓN INVALIDADA
+                    // ==================================
+
+                    if (
+                        loggedOut
+                    ) {
+
                         qrCodeData = '';
+
 
                         console.log(
                             'WhatsApp cerró la sesión.'
                         );
 
+
                         console.log(
-                            'Debe vincular nuevamente el dispositivo.'
+                            'Debe vincular nuevamente ' +
+                            'el dispositivo.'
                         );
+
 
                         return;
                     }
 
-                    programarReconexion(3000);
+
+                    // ==================================
+                    // ERROR 440
+                    // CONFLICT / REPLACED
+                    // ==================================
+
+                    if (
+                        statusCode === 440
+                    ) {
+
+                        console.log(
+
+                            'Conflicto 440/replaced detectado. ' +
+                            'Esperando 15 segundos antes de reconectar...'
+
+                        );
+
+
+                        /*
+                         * Quitamos el socket que recibió
+                         * el conflicto.
+                         */
+                        if (
+                            sock === currentSock
+                        ) {
+
+                            sock = null;
+
+                        }
+
+
+                        /*
+                         * Invalida inmediatamente todos
+                         * los eventos posteriores que puedan
+                         * provenir del socket anterior.
+                         */
+                        socketGeneration++;
+
+
+                        /*
+                         * Eliminamos cualquier reconexión
+                         * que estuviera pendiente.
+                         */
+                        if (
+                            reconnectTimer
+                        ) {
+
+                            clearTimeout(
+                                reconnectTimer
+                            );
+
+                        }
+
+
+                        /*
+                         * Render puede mantener durante unos
+                         * segundos la instancia anterior.
+                         *
+                         * Por eso esperamos 15 segundos.
+                         */
+                        reconnectTimer =
+                            setTimeout(
+
+                                async () => {
+
+                                    reconnectTimer = null;
+
+
+                                    /*
+                                     * Si mientras esperábamos
+                                     * WhatsApp volvió a conectarse,
+                                     * no hacemos nada.
+                                     */
+                                    if (
+                                        cambiandoNumero ||
+                                        conectado
+                                    ) {
+
+                                        return;
+                                    }
+
+
+                                    try {
+
+                                        await connectToWhatsApp();
+
+
+                                    } catch (error) {
+
+                                        console.error(
+
+                                            'Error después del conflicto 440:',
+
+                                            error.message
+
+                                        );
+
+
+                                        programarReconexion(
+                                            10000
+                                        );
+
+                                    }
+
+                                },
+
+                                15000
+
+                            );
+
+
+                        return;
+
+                    }
+
+
+                    // ==================================
+                    // OTRAS DESCONEXIONES
+                    // ==================================
+
+                    /*
+                     * El socket cerrado deja de ser válido.
+                     */
+                    if (
+                        sock === currentSock
+                    ) {
+
+                        sock = null;
+
+                    }
+
+
+                    /*
+                     * Invalidamos cualquier evento posterior
+                     * perteneciente a este socket.
+                     */
+                    socketGeneration++;
+
+
+                    /*
+                     * Para errores normales esperamos
+                     * 5 segundos.
+                     */
+                    programarReconexion(
+                        5000
+                    );
+
                 }
+
             }
+
         );
+
 
     } catch (error) {
-        conectado = false;
-        conectando = false;
+
+
+        /*
+         * Solo modificamos el estado global
+         * si este sigue siendo el intento actual.
+         */
+        if (
+            myGeneration === socketGeneration
+        ) {
+
+            conectado = false;
+
+            conectando = false;
+
+            sock = null;
+
+
+            socketGeneration++;
+
+        }
+
 
         console.error(
+
             'ERROR DE WHATSAPP:',
+
             error
+
         );
 
-        programarReconexion(5000);
+
+        /*
+         * Si hubo un error creando el socket
+         * esperamos un poco más antes de intentar.
+         */
+        programarReconexion(
+            10000
+        );
+
     }
+
 }
 
 // ======================================================
@@ -940,6 +1344,12 @@ app.post(
             );
 
             const socketAnterior = sock;
+
+            /*
+            * Invalidamos inmediatamente los eventos
+            * pertenecientes al socket anterior.
+            */
+            socketGeneration++;
 
             sock = null;
 
