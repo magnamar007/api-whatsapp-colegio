@@ -1,21 +1,25 @@
 const {
     default: makeWASocket,
-    useMultiFileAuthState,
     Browsers,
-    DisconnectReason
+    DisconnectReason,
+    initAuthCreds,
+    BufferJSON,
+    proto
 } = require('@whiskeysockets/baileys');
 
 const express = require('express');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
-
 const { createClient } = require('@supabase/supabase-js');
-const fs = require('fs/promises');
-const path = require('path');
 
 const app = express();
 
-const AUTH_DIR = path.join(__dirname, 'auth_info');
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ======================================================
+// CONFIGURACIÓN SUPABASE
+// ======================================================
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
@@ -24,6 +28,7 @@ if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
     console.error(
         'ERROR: Faltan SUPABASE_URL o SUPABASE_SECRET_KEY.'
     );
+    process.exit(1);
 }
 
 const supabase = createClient(
@@ -37,212 +42,394 @@ const supabase = createClient(
     }
 );
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ======================================================
+// ESTADO GENERAL
+// ======================================================
 
 let sock = null;
 let conectado = false;
 let conectando = false;
 let qrCodeData = '';
+let cambiandoNumero = false;
+let reconnectTimer = null;
 
-// ============================================
-// PERSISTENCIA DE SESIÓN EN SUPABASE
-// ============================================
+// IDs utilizados en Supabase.
+const CREDS_ID = 'baileys:creds';
+const KEY_PREFIX = 'baileys:key:';
 
-async function restaurarSesion() {
-    try {
-        console.log('Buscando sesión de WhatsApp en Supabase...');
+// ======================================================
+// SERIALIZACIÓN BAILEYS
+// ======================================================
 
-        const { data, error } = await supabase
-            .from('whatsapp_session')
-            .select('id, data');
+function serializar(valor) {
+    const texto = JSON.stringify(
+        valor,
+        BufferJSON.replacer
+    );
 
-        if (error) {
-            throw error;
-        }
+    return JSON.parse(texto);
+}
 
-        if (!data || data.length === 0) {
-            console.log(
-                'No existe sesión guardada en Supabase. ' +
-                'Será necesario vincular WhatsApp.'
-            );
-            return;
-        }
+function deserializar(valor) {
+    if (valor === null || valor === undefined) {
+        return null;
+    }
 
-        await fs.mkdir(AUTH_DIR, { recursive: true });
+    return JSON.parse(
+        JSON.stringify(valor),
+        BufferJSON.reviver
+    );
+}
 
-        for (const fila of data) {
-            if (!fila.id || !fila.data) {
-                continue;
+// ======================================================
+// SUPABASE - LEER REGISTRO
+// ======================================================
+
+async function leerRegistro(id) {
+    const { data, error } = await supabase
+        .from('whatsapp_session')
+        .select('data')
+        .eq('id', id)
+        .maybeSingle();
+
+    if (error) {
+        throw new Error(
+            `Error leyendo ${id}: ${error.message}`
+        );
+    }
+
+    if (!data) {
+        return null;
+    }
+
+    return deserializar(data.data);
+}
+
+// ======================================================
+// SUPABASE - GUARDAR REGISTRO
+// ======================================================
+
+async function guardarRegistro(id, valor) {
+    const { error } = await supabase
+        .from('whatsapp_session')
+        .upsert(
+            {
+                id,
+                data: serializar(valor),
+                updated_at: new Date().toISOString()
+            },
+            {
+                onConflict: 'id'
             }
-
-            const contenido = fila.data.content;
-
-            if (typeof contenido !== 'string') {
-                continue;
-            }
-
-            /*
-             * Evita que un nombre almacenado pueda escribir
-             * fuera de auth_info.
-             */
-            const nombreArchivo = path.basename(fila.id);
-
-            await fs.writeFile(
-                path.join(AUTH_DIR, nombreArchivo),
-                contenido,
-                'utf8'
-            );
-        }
-
-        console.log(
-            `Sesión restaurada desde Supabase: ${data.length} archivo(s).`
         );
 
-    } catch (error) {
-        console.error(
-            'Error restaurando sesión desde Supabase:',
-            error.message
+    if (error) {
+        throw new Error(
+            `Error guardando ${id}: ${error.message}`
         );
     }
 }
 
+// ======================================================
+// SUPABASE - ELIMINAR REGISTRO
+// ======================================================
 
-async function guardarSesionEnSupabase() {
-    try {
-        const archivos = await fs.readdir(AUTH_DIR);
+async function eliminarRegistro(id) {
+    const { error } = await supabase
+        .from('whatsapp_session')
+        .delete()
+        .eq('id', id);
 
-        for (const archivo of archivos) {
-            const ruta = path.join(AUTH_DIR, archivo);
+    if (error) {
+        throw new Error(
+            `Error eliminando ${id}: ${error.message}`
+        );
+    }
+}
 
-            const info = await fs.stat(ruta);
+// ======================================================
+// CREAR AUTH STATE DIRECTAMENTE EN SUPABASE
+// ======================================================
 
-            if (!info.isFile()) {
-                continue;
-            }
+async function useSupabaseAuthState() {
+    let creds = await leerRegistro(CREDS_ID);
 
-            const contenido = await fs.readFile(
-                ruta,
-                'utf8'
-            );
+    if (!creds) {
+        console.log(
+            'No existe sesión persistente. Creando credenciales nuevas.'
+        );
 
-            const { error } = await supabase
-                .from('whatsapp_session')
-                .upsert(
-                    {
-                        id: archivo,
-                        data: {
-                            content: contenido
-                        },
-                        updated_at: new Date().toISOString()
-                    },
-                    {
-                        onConflict: 'id'
+        creds = initAuthCreds();
+
+        await guardarRegistro(
+            CREDS_ID,
+            creds
+        );
+    } else {
+        console.log(
+            'Credenciales de WhatsApp recuperadas desde Supabase.'
+        );
+    }
+
+    const keys = {
+        get: async (type, ids) => {
+            const resultado = {};
+
+            await Promise.all(
+                ids.map(async (id) => {
+                    const registroId =
+                        `${KEY_PREFIX}${type}:${id}`;
+
+                    let valor =
+                        await leerRegistro(registroId);
+
+                    if (
+                        type === 'app-state-sync-key' &&
+                        valor
+                    ) {
+                        valor =
+                            proto.Message
+                                .AppStateSyncKeyData
+                                .fromObject(valor);
                     }
-                );
 
-            if (error) {
-                throw error;
+                    if (valor !== null) {
+                        resultado[id] = valor;
+                    }
+                })
+            );
+
+            return resultado;
+        },
+
+        set: async (data) => {
+            const operaciones = [];
+
+            for (
+                const categoria of Object.keys(data)
+            ) {
+                const valores = data[categoria];
+
+                for (
+                    const id of Object.keys(valores)
+                ) {
+                    const valor = valores[id];
+
+                    const registroId =
+                        `${KEY_PREFIX}${categoria}:${id}`;
+
+                    if (
+                        valor === null ||
+                        valor === undefined
+                    ) {
+                        operaciones.push(
+                            eliminarRegistro(registroId)
+                        );
+                    } else {
+                        operaciones.push(
+                            guardarRegistro(
+                                registroId,
+                                valor
+                            )
+                        );
+                    }
+                }
             }
-        }
 
-        console.log(
-            `Sesión respaldada en Supabase: ${archivos.length} archivo(s).`
+            await Promise.all(operaciones);
+        }
+    };
+
+    const saveCreds = async () => {
+        await guardarRegistro(
+            CREDS_ID,
+            creds
+        );
+    };
+
+    return {
+        state: {
+            creds,
+            keys
+        },
+        saveCreds
+    };
+}
+
+// ======================================================
+// LIMPIAR SESIÓN DE SUPABASE
+// ======================================================
+
+async function limpiarSesionSupabase() {
+    console.log(
+        'Eliminando sesión persistente de WhatsApp...'
+    );
+
+    const { error } = await supabase
+        .from('whatsapp_session')
+        .delete()
+        .or(
+            `id.eq.${CREDS_ID},id.like.${KEY_PREFIX}%`
         );
 
-    } catch (error) {
-        console.error(
-            'Error guardando sesión en Supabase:',
+    if (error) {
+        throw new Error(
+            'No se pudo limpiar la sesión: ' +
             error.message
         );
     }
+
+    console.log(
+        'Sesión de WhatsApp eliminada de Supabase.'
+    );
 }
 
-// ============================================
+// ======================================================
+// PROGRAMAR RECONEXIÓN
+// ======================================================
+
+function programarReconexion(ms = 3000) {
+    if (cambiandoNumero) {
+        return;
+    }
+
+    if (reconnectTimer) {
+        return;
+    }
+
+    console.log(
+        `Reconectando en ${ms / 1000} segundos...`
+    );
+
+    reconnectTimer = setTimeout(
+        async () => {
+            reconnectTimer = null;
+
+            try {
+                await connectToWhatsApp();
+            } catch (error) {
+                console.error(
+                    'Error durante reconexión:',
+                    error.message
+                );
+            }
+        },
+        ms
+    );
+}
+
+// ======================================================
 // CONECTAR WHATSAPP
-// ============================================
+// ======================================================
 
 async function connectToWhatsApp() {
-
     if (conectando) {
-        console.log('Ya existe un intento de conexión.');
+        console.log(
+            'Ya existe un intento de conexión.'
+        );
         return;
     }
 
     conectando = true;
 
     try {
+        console.log(
+            'Iniciando conexión con WhatsApp...'
+        );
 
-        console.log('Iniciando conexión con WhatsApp...');
-
-        const { state, saveCreds } =
-            await useMultiFileAuthState('auth_info');
+        const {
+            state,
+            saveCreds
+        } = await useSupabaseAuthState();
 
         sock = makeWASocket({
             auth: state,
-            browser: Browsers.macOS('Desktop'),
+
+            browser:
+                Browsers.macOS('Desktop'),
+
             syncFullHistory: false,
+
             markOnlineOnConnect: false
         });
 
+        // ==============================================
+        // GUARDAR CREDENCIALES
+        // ==============================================
 
-        // Guardar credenciales
-        sock.ev.on('creds.update', async () => {
-    try {
-        await saveCreds();
-        await guardarSesionEnSupabase();
-    } catch (error) {
-        console.error(
-            'Error actualizando credenciales:',
-            error.message
+        sock.ev.on(
+            'creds.update',
+            async () => {
+                try {
+                    await saveCreds();
+
+                    console.log(
+                        'Credenciales actualizadas en Supabase.'
+                    );
+                } catch (error) {
+                    console.error(
+                        'Error guardando credenciales:',
+                        error.message
+                    );
+                }
+            }
         );
-    }
-});
 
-
-        // ============================================
+        // ==============================================
         // EVENTOS DE CONEXIÓN
-        // ============================================
+        // ==============================================
 
         sock.ev.on(
             'connection.update',
-            ({ connection, qr, lastDisconnect }) => {
-
-                // NUEVO QR
+            ({
+                connection,
+                qr,
+                lastDisconnect
+            }) => {
                 if (qr) {
-
                     qrCodeData = qr;
 
                     console.log('');
-                    console.log('================================');
-                    console.log('NUEVO QR GENERADO');
-                    console.log('================================');
-                    console.log('Visite /qr para escanearlo.');
+                    console.log(
+                        '================================'
+                    );
+                    console.log(
+                        'NUEVO QR GENERADO'
+                    );
+                    console.log(
+                        '================================'
+                    );
+                    console.log(
+                        'Visite /qr para escanearlo.'
+                    );
 
                     qrcodeTerminal.generate(
                         qr,
-                        { small: true }
+                        {
+                            small: true
+                        }
                     );
                 }
 
-
-                // CONEXIÓN ABIERTA
                 if (connection === 'open') {
-
                     conectado = true;
                     conectando = false;
+                    cambiandoNumero = false;
                     qrCodeData = '';
 
                     console.log('');
-                    console.log('================================');
-                    console.log('WHATSAPP CONECTADO');
-                    console.log('================================');
+                    console.log(
+                        '================================'
+                    );
+                    console.log(
+                        'WHATSAPP CONECTADO'
+                    );
+                    console.log(
+                        '================================'
+                    );
                 }
 
-
-                // CONEXIÓN CERRADA
                 if (connection === 'close') {
-
                     conectado = false;
                     conectando = false;
 
@@ -257,41 +444,38 @@ async function connectToWhatsApp() {
                         statusCode
                     );
 
-                    const cerrarSesion =
+                    const loggedOut =
                         statusCode ===
                         DisconnectReason.loggedOut;
 
+                    if (cambiandoNumero) {
+                        console.log(
+                            'Cambio de número en proceso.'
+                        );
 
-                    if (cerrarSesion) {
+                        return;
+                    }
 
+                    if (loggedOut) {
                         qrCodeData = '';
 
                         console.log(
-                            'La sesión fue cerrada.'
+                            'WhatsApp cerró la sesión.'
                         );
 
                         console.log(
-                            'Se necesita una nueva vinculación.'
+                            'Debe vincular nuevamente el dispositivo.'
                         );
 
-                    } else {
-
-                        console.log(
-                            'Reconectando en 3 segundos...'
-                        );
-
-                        setTimeout(
-                            connectToWhatsApp,
-                            3000
-                        );
+                        return;
                     }
+
+                    programarReconexion(3000);
                 }
             }
         );
 
-
     } catch (error) {
-
         conectado = false;
         conectando = false;
 
@@ -300,19 +484,19 @@ async function connectToWhatsApp() {
             error
         );
 
-        setTimeout(
-            connectToWhatsApp,
-            5000
-        );
+        programarReconexion(5000);
     }
 }
 
-
-// ============================================
+// ======================================================
 // PÁGINA PRINCIPAL
-// ============================================
+// ======================================================
 
 app.get('/', (req, res) => {
+    const estado =
+        conectado
+            ? '🟢 WhatsApp conectado'
+            : '🔴 WhatsApp desconectado';
 
     res.send(`
         <!DOCTYPE html>
@@ -322,36 +506,101 @@ app.get('/', (req, res) => {
         <head>
             <meta charset="UTF-8">
 
+            <meta
+                name="viewport"
+                content="width=device-width, initial-scale=1"
+            >
+
             <title>
                 API WhatsApp Colegio
             </title>
         </head>
 
         <body style="
-            font-family:Arial;
-            text-align:center;
-            padding:50px;
+            margin:0;
+            background:#f0f2f5;
+            font-family:Arial,sans-serif;
         ">
 
-            <h1>
-                API WhatsApp - Colegio Petrolera II
-            </h1>
+            <div style="
+                max-width:600px;
+                margin:70px auto;
+                background:white;
+                padding:35px;
+                border-radius:15px;
+                box-shadow:0 4px 20px rgba(0,0,0,.12);
+                text-align:center;
+            ">
 
-            <p>
-                Estado del servidor: funcionando
-            </p>
+                <h1>
+                    API WhatsApp
+                </h1>
 
-            <p>
-                <a href="/qr">
-                    Vincular WhatsApp
-                </a>
-            </p>
+                <h2>
+                    Colegio Petrolera II
+                </h2>
 
-            <p>
-                <a href="/health">
-                    Ver estado
-                </a>
-            </p>
+                <p style="
+                    font-size:20px;
+                    margin:30px 0;
+                ">
+                    ${estado}
+                </p>
+
+                <p>
+                    <a href="/qr">
+                        Vincular / Ver WhatsApp
+                    </a>
+                </p>
+
+                <p>
+                    <a href="/health">
+                        Consultar estado
+                    </a>
+                </p>
+
+                ${
+                    conectado
+                        ? `
+                            <hr style="margin:30px 0;">
+
+                            <h3>
+                                Cambiar número de WhatsApp
+                            </h3>
+
+                            <p>
+                                Esta opción cerrará la sesión actual
+                                y permitirá vincular otro número.
+                            </p>
+
+                            <form
+                                method="POST"
+                                action="/logout"
+                                onsubmit="
+                                    return confirm(
+                                        '¿Está seguro de cambiar el número de WhatsApp?'
+                                    );
+                                "
+                            >
+                                <button
+                                    type="submit"
+                                    style="
+                                        background:#c62828;
+                                        color:white;
+                                        border:none;
+                                        border-radius:8px;
+                                        padding:12px 20px;
+                                        cursor:pointer;
+                                    "
+                                >
+                                    Cambiar número
+                                </button>
+                            </form>
+                        `
+                        : ''
+                }
+
+            </div>
 
         </body>
 
@@ -359,16 +608,12 @@ app.get('/', (req, res) => {
     `);
 });
 
-
-// ============================================
+// ======================================================
 // MOSTRAR QR
-// ============================================
+// ======================================================
 
 app.get('/qr', async (req, res) => {
-
-    // YA ESTÁ CONECTADO
     if (conectado) {
-
         return res.send(`
             <!DOCTYPE html>
 
@@ -396,9 +641,11 @@ app.get('/qr', async (req, res) => {
                     El dispositivo ya está vinculado.
                 </p>
 
-                <a href="/health">
-                    Consultar estado
-                </a>
+                <p>
+                    <a href="/">
+                        Volver al inicio
+                    </a>
+                </p>
 
             </body>
 
@@ -406,17 +653,13 @@ app.get('/qr', async (req, res) => {
         `);
     }
 
-
-    // TODAVÍA NO EXISTE QR
     if (!qrCodeData) {
-
         return res.send(`
             <!DOCTYPE html>
 
             <html lang="es">
 
             <head>
-
                 <meta charset="UTF-8">
 
                 <meta
@@ -427,7 +670,6 @@ app.get('/qr', async (req, res) => {
                 <title>
                     Generando QR
                 </title>
-
             </head>
 
             <body style="
@@ -455,10 +697,7 @@ app.get('/qr', async (req, res) => {
         `);
     }
 
-
-    // GENERAR IMAGEN
     try {
-
         const qrImage =
             await QRCode.toDataURL(
                 qrCodeData,
@@ -469,14 +708,12 @@ app.get('/qr', async (req, res) => {
                 }
             );
 
-
         res.send(`
             <!DOCTYPE html>
 
             <html lang="es">
 
             <head>
-
                 <meta charset="UTF-8">
 
                 <meta
@@ -487,16 +724,13 @@ app.get('/qr', async (req, res) => {
                 <title>
                     Vincular WhatsApp
                 </title>
-
             </head>
-
 
             <body style="
                 margin:0;
                 background:#f0f2f5;
                 font-family:Arial;
             ">
-
 
                 <div style="
                     display:flex;
@@ -506,20 +740,17 @@ app.get('/qr', async (req, res) => {
                     min-height:100vh;
                 ">
 
-
                     <div style="
                         background:white;
                         padding:30px;
                         border-radius:15px;
                         text-align:center;
-                        box-shadow:0 4px 20px
-                        rgba(0,0,0,.15);
+                        box-shadow:0 4px 20px rgba(0,0,0,.15);
                     ">
 
                         <h2>
                             Vincular WhatsApp
                         </h2>
-
 
                         <p>
                             WhatsApp →
@@ -527,16 +758,14 @@ app.get('/qr', async (req, res) => {
                             Vincular dispositivo
                         </p>
 
-
                         <img
                             src="${qrImage}"
                             alt="QR WhatsApp"
                             style="
-                                width:450px;
-                                height:450px;
+                                width:100%;
+                                max-width:450px;
                             "
                         >
-
 
                         <p style="color:#777;">
                             Escanee este código
@@ -552,9 +781,7 @@ app.get('/qr', async (req, res) => {
             </html>
         `);
 
-
     } catch (error) {
-
         console.error(
             'Error generando QR:',
             error
@@ -568,15 +795,12 @@ app.get('/qr', async (req, res) => {
     }
 });
 
-
-// ============================================
+// ======================================================
 // HEALTH
-// ============================================
+// ======================================================
 
 app.get('/health', (req, res) => {
-
     res.json({
-
         status: 'ok',
 
         whatsapp:
@@ -591,126 +815,247 @@ app.get('/health', (req, res) => {
     });
 });
 
-
-// ============================================
+// ======================================================
 // ENVIAR MENSAJES
-// ============================================
+// ======================================================
 
-app.post('/send-message', async (req, res) => {
+app.post(
+    '/send-message',
+    async (req, res) => {
+        const {
+            number,
+            message
+        } = req.body;
 
-    const {
-        number,
-        message
-    } = req.body;
+        if (!number || !message) {
+            return res
+                .status(400)
+                .json({
+                    status: 'error',
 
+                    message:
+                        'Faltan los parámetros number o message.'
+                });
+        }
 
-    if (!number || !message) {
+        if (!sock || !conectado) {
+            return res
+                .status(503)
+                .json({
+                    status: 'error',
 
-        return res
-            .status(400)
-            .json({
+                    message:
+                        'WhatsApp no está conectado.'
+                });
+        }
 
-                status: 'error',
+        const limpio =
+            String(number)
+                .replace(
+                    /[^0-9]/g,
+                    ''
+                );
+
+        if (!limpio) {
+            return res
+                .status(400)
+                .json({
+                    status: 'error',
+                    message:
+                        'El número de teléfono no es válido.'
+                });
+        }
+
+        const jid =
+            limpio +
+            '@s.whatsapp.net';
+
+        try {
+            await sock.sendMessage(
+                jid,
+                {
+                    text:
+                        String(message)
+                }
+            );
+
+            console.log(
+                'Mensaje enviado a:',
+                limpio
+            );
+
+            res.json({
+                status: 'success',
 
                 message:
-                    'Faltan los parámetros number o message.'
+                    'Mensaje enviado correctamente.'
             });
+
+        } catch (error) {
+            console.error(
+                'Error enviando mensaje:',
+                error
+            );
+
+            res
+                .status(500)
+                .json({
+                    status: 'error',
+                    message:
+                        error.message
+                });
+        }
     }
+);
 
+// ======================================================
+// CERRAR SESIÓN / CAMBIAR NÚMERO
+// ======================================================
 
-    if (!sock || !conectado) {
+app.post(
+    '/logout',
+    async (req, res) => {
+        if (cambiandoNumero) {
+            return res
+                .status(409)
+                .send(
+                    'Ya existe un cambio de número en proceso.'
+                );
+        }
 
-        return res
-            .status(503)
-            .json({
+        cambiandoNumero = true;
 
-                status: 'error',
+        if (reconnectTimer) {
+            clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
 
-                message:
-                    'WhatsApp no está conectado.'
-            });
-    }
+        conectado = false;
+        conectando = false;
+        qrCodeData = '';
 
+        try {
+            console.log(
+                'Iniciando cambio de número...'
+            );
 
-    const limpio =
-        String(number)
-            .replace(/[^0-9]/g, '');
+            const socketAnterior = sock;
 
+            sock = null;
 
-    const jid =
-        limpio + '@s.whatsapp.net';
-
-
-    try {
-
-        await sock.sendMessage(
-            jid,
-            {
-                text: String(message)
+            /*
+             * logout() informa a WhatsApp que este
+             * dispositivo vinculado debe cerrarse.
+             */
+            if (socketAnterior) {
+                try {
+                    await socketAnterior.logout();
+                } catch (errorLogout) {
+                    console.log(
+                        'Aviso durante logout:',
+                        errorLogout.message
+                    );
+                }
             }
-        );
 
-        await guardarSesionEnSupabase();
+            await limpiarSesionSupabase();
 
-        console.log(
-            'Mensaje enviado a:',
-            limpio
-        );
+            console.log(
+                'Sesión anterior eliminada.'
+            );
 
+            /*
+             * Permitimos nuevamente la conexión.
+             */
+            cambiandoNumero = false;
 
-        res.json({
+            setTimeout(
+                () => {
+                    connectToWhatsApp()
+                        .catch((error) => {
+                            console.error(
+                                'Error generando nueva sesión:',
+                                error.message
+                            );
+                        });
+                },
+                1500
+            );
 
-            status: 'success',
+            return res.send(`
+                <!DOCTYPE html>
 
-            message:
-                'Mensaje enviado correctamente.'
-        });
+                <html lang="es">
 
+                <head>
+                    <meta charset="UTF-8">
 
-    } catch (error) {
+                    <meta
+                        http-equiv="refresh"
+                        content="3;url=/qr"
+                    >
 
-        console.error(
-            'Error enviando mensaje:',
-            error
-        );
+                    <title>
+                        Cambiar WhatsApp
+                    </title>
+                </head>
 
+                <body style="
+                    font-family:Arial;
+                    text-align:center;
+                    padding-top:100px;
+                ">
 
-        res
-            .status(500)
-            .json({
+                    <h2>
+                        Sesión anterior eliminada
+                    </h2>
 
-                status: 'error',
+                    <p>
+                        Estamos generando un nuevo
+                        código QR.
+                    </p>
 
-                message:
+                    <p>
+                        Será redirigido automáticamente.
+                    </p>
+
+                    <p>
+                        <a href="/qr">
+                            Ir al nuevo QR
+                        </a>
+                    </p>
+
+                </body>
+
+                </html>
+            `);
+
+        } catch (error) {
+            cambiandoNumero = false;
+
+            console.error(
+                'Error cambiando número:',
+                error
+            );
+
+            programarReconexion(3000);
+
+            return res
+                .status(500)
+                .send(
+                    'No fue posible cambiar el número: ' +
                     error.message
-            });
+                );
+        }
     }
-});
+);
 
-
-// ============================================
+// ======================================================
 // INICIAR SERVIDOR
-// ============================================
+// ======================================================
 
-const PORT = process.env.PORT || 3000;
-
-async function iniciarServidor() {
-    try {
-        console.log('Restaurando sesión desde Supabase...');
-
-        await restaurarSesion();
-
-        console.log('Iniciando conexión con WhatsApp...');
-
-        await connectToWhatsApp();
-
-    } catch (error) {
-        console.error(
-            'Error iniciando WhatsApp:',
-            error
-        );
-    }
-}
+const PORT =
+    process.env.PORT || 3000;
 
 app.listen(
     PORT,
@@ -720,6 +1065,12 @@ app.listen(
             `Servidor iniciado en puerto ${PORT}`
         );
 
-        iniciarServidor();
+        connectToWhatsApp()
+            .catch((error) => {
+                console.error(
+                    'Error iniciando WhatsApp:',
+                    error
+                );
+            });
     }
 );
