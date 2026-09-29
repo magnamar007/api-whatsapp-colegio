@@ -9,7 +9,33 @@ const express = require('express');
 const qrcodeTerminal = require('qrcode-terminal');
 const QRCode = require('qrcode');
 
+const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs/promises');
+const path = require('path');
+
 const app = express();
+
+const AUTH_DIR = path.join(__dirname, 'auth_info');
+
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+
+if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    console.error(
+        'ERROR: Faltan SUPABASE_URL o SUPABASE_SECRET_KEY.'
+    );
+}
+
+const supabase = createClient(
+    SUPABASE_URL,
+    SUPABASE_SECRET_KEY,
+    {
+        auth: {
+            persistSession: false,
+            autoRefreshToken: false
+        }
+    }
+);
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -19,6 +45,118 @@ let conectado = false;
 let conectando = false;
 let qrCodeData = '';
 
+// ============================================
+// PERSISTENCIA DE SESIÓN EN SUPABASE
+// ============================================
+
+async function restaurarSesion() {
+    try {
+        console.log('Buscando sesión de WhatsApp en Supabase...');
+
+        const { data, error } = await supabase
+            .from('whatsapp_session')
+            .select('id, data');
+
+        if (error) {
+            throw error;
+        }
+
+        if (!data || data.length === 0) {
+            console.log(
+                'No existe sesión guardada en Supabase. ' +
+                'Será necesario vincular WhatsApp.'
+            );
+            return;
+        }
+
+        await fs.mkdir(AUTH_DIR, { recursive: true });
+
+        for (const fila of data) {
+            if (!fila.id || !fila.data) {
+                continue;
+            }
+
+            const contenido = fila.data.content;
+
+            if (typeof contenido !== 'string') {
+                continue;
+            }
+
+            /*
+             * Evita que un nombre almacenado pueda escribir
+             * fuera de auth_info.
+             */
+            const nombreArchivo = path.basename(fila.id);
+
+            await fs.writeFile(
+                path.join(AUTH_DIR, nombreArchivo),
+                contenido,
+                'utf8'
+            );
+        }
+
+        console.log(
+            `Sesión restaurada desde Supabase: ${data.length} archivo(s).`
+        );
+
+    } catch (error) {
+        console.error(
+            'Error restaurando sesión desde Supabase:',
+            error.message
+        );
+    }
+}
+
+
+async function guardarSesionEnSupabase() {
+    try {
+        const archivos = await fs.readdir(AUTH_DIR);
+
+        for (const archivo of archivos) {
+            const ruta = path.join(AUTH_DIR, archivo);
+
+            const info = await fs.stat(ruta);
+
+            if (!info.isFile()) {
+                continue;
+            }
+
+            const contenido = await fs.readFile(
+                ruta,
+                'utf8'
+            );
+
+            const { error } = await supabase
+                .from('whatsapp_session')
+                .upsert(
+                    {
+                        id: archivo,
+                        data: {
+                            content: contenido
+                        },
+                        updated_at: new Date().toISOString()
+                    },
+                    {
+                        onConflict: 'id'
+                    }
+                );
+
+            if (error) {
+                throw error;
+            }
+        }
+
+        console.log(
+            `Sesión respaldada en Supabase: ${archivos.length} archivo(s).`
+        );
+
+    } catch (error) {
+        console.error(
+            'Error guardando sesión en Supabase:',
+            error.message
+        );
+    }
+}
 
 // ============================================
 // CONECTAR WHATSAPP
@@ -49,7 +187,17 @@ async function connectToWhatsApp() {
 
 
         // Guardar credenciales
-        sock.ev.on('creds.update', saveCreds);
+        sock.ev.on('creds.update', async () => {
+    try {
+        await saveCreds();
+        await guardarSesionEnSupabase();
+    } catch (error) {
+        console.error(
+            'Error actualizando credenciales:',
+            error.message
+        );
+    }
+});
 
 
         // ============================================
@@ -502,6 +650,7 @@ app.post('/send-message', async (req, res) => {
             }
         );
 
+        await guardarSesionEnSupabase();
 
         console.log(
             'Mensaje enviado a:',
@@ -543,19 +692,34 @@ app.post('/send-message', async (req, res) => {
 // INICIAR SERVIDOR
 // ============================================
 
-const PORT =
-    process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
 
+async function iniciarServidor() {
+    try {
+        console.log('Restaurando sesión desde Supabase...');
+
+        await restaurarSesion();
+
+        console.log('Iniciando conexión con WhatsApp...');
+
+        await connectToWhatsApp();
+
+    } catch (error) {
+        console.error(
+            'Error iniciando WhatsApp:',
+            error
+        );
+    }
+}
 
 app.listen(
     PORT,
     '0.0.0.0',
     () => {
-
         console.log(
             `Servidor iniciado en puerto ${PORT}`
         );
 
-        connectToWhatsApp();
+        iniciarServidor();
     }
 );
